@@ -1,10 +1,15 @@
 /* globals mapboxgl */
+
 var fs = require('fs')
 var path = require('path')
 var Qty = require('js-quantities')
-var remote = require('electron').remote
-var toBuffer = require('blob-to-buffer')
-var geoViewport = require('geo-viewport')
+var calcViewport = require('./lib/viewport')
+var createGlPixelStream = require('gl-pixel-stream')
+var PNGEncoder = require('png-stream/encoder')
+var createFBO = require('gl-fbo')
+var MultiStream = require('multistream')
+var pump = require('pump')
+var limit = require('./lib/limit_stream')
 
 var argv = require('minimist')(process.argv.slice(2), {
   alias: {
@@ -35,26 +40,69 @@ var style = argv._[0]
 var outFile = absolute(argv.output)
 
 var pixelRatio = window.devicePixelRatio = argv.dpi / 72
-var winWidth = parseInt(parseLengthToPixels(argv.width) / pixelRatio, 10)
-var winHeight = parseInt(parseLengthToPixels(argv.height) / pixelRatio, 10)
+var pixelWidth = parseLengthToPixels(argv.width)
+var pixelHeight = parseLengthToPixels(argv.height)
 
 var mapDiv = document.getElementById('map')
-mapDiv.style.width = winWidth + 'px'
-mapDiv.style.height = winHeight + 'px'
 
 mapboxgl.accessToken = argv.token
 
 var map = new mapboxgl.Map({
   container: 'map',
-  style: style,
-  preserveDrawingBuffer: true
+  style: style
 })
 
-fitBounds(map, parseBounds(argv.bounds))
+var gl = map.painter.gl
+
+var viewport = calcViewport(map, parseBounds(argv.bounds), [pixelWidth, pixelHeight])
+
+var sections = getSections(viewport, [pixelWidth, pixelHeight], gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) * 250)
+var length = sections.length
 
 map.on('load', function () {
-  map.getCanvas().toBlob(write, parseFormat(argv.format), argv.quality)
+  var pngEncoder = new PNGEncoder(pixelWidth, pixelHeight, {colorSpace: 'rgba'})
+
+  var ws
+  if (outFile) {
+    ws = fs.createWriteStream(outFile)
+  } else {
+    ws = process.stdout
+  }
+
+  pump(MultiStream(drawSection), pngEncoder, ws, done)
 })
+
+function drawSection (cb) {
+  if (!sections.length) return cb(null, null)
+  var processing = false
+
+  var section = sections.shift()
+  var fbo = createFBO(gl, section.shape, {stencil: true})
+  fbo.bind()
+
+  mapDiv.style.width = section.shape[0] / pixelRatio + 'px'
+  mapDiv.style.height = section.shape[1] / pixelRatio + 'px'
+  map.resize()._update()
+
+  map.once('moveend', function () {
+    map.on('render', onRender)
+  })
+
+  map.jumpTo(section.viewport)
+
+  function onRender () {
+    if (!map.animationLoop.stopped() || processing || !map.loaded()) return
+    console.log('section:', length - sections.length)
+    map.off('render', onRender)
+    processing = true
+    var glStream = createGlPixelStream(gl, fbo.handle, fbo.shape, {flipY: true})
+    glStream.on('end', () => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    })
+    var format = {width: section.shape[0], height: section.shape[1]}
+    cb(null, glStream.pipe(limit(format)))
+  }
+}
 
 function parseBounds (bounds) {
   var b = bounds.split(',').map(parseFloat)
@@ -68,7 +116,7 @@ function parseLengthToPixels (length) {
   if (qty.kind() !== 'length') throw new Error('Invalid units')
   // Yikes, can't find method to get a unitless number back!
   // TODO: Use a better unit conversion library
-  return parseFloat(qty.to('in').toString()) * window.devicePixelRatio * 72
+  return Math.ceil(parseFloat(qty.to('in').toString()) * 72) * window.devicePixelRatio
 }
 
 function parseFormat (format) {
@@ -86,41 +134,43 @@ function parseFormat (format) {
   }
 }
 
-function fitBounds (map, bounds) {
-  var llb = mapboxgl.LngLatBounds.convert(bounds)
-  var dim = map.project(map.getBounds().getSouthEast())
-  var nw = map.project(llb.getNorthWest())
-  var se = map.project(llb.getSouthEast())
-  var size = se.sub(nw)
-  var scaleX = dim.x / size.x
-  var scaleY = dim.y / size.y
-  var tr = map.transform
-  var zoom = tr.scaleZoom(tr.scale * Math.min(scaleX, scaleY))
-
-  var options = {
-    center: map.unproject(nw.add(se).div(2)),
-    zoom: zoom,
-    bearing: 0
+function getSections (viewport, dimensions, maxPixels) {
+  var ne = viewport.bounds.getNorthEast()
+  var sw = viewport.bounds.getSouthWest()
+  var centerLng = sw.lng + (ne.lng - sw.lng) / 2
+  var w = dimensions[0]
+  var h = dimensions[1]
+  var sectionHeight = Math.floor(maxPixels / w)
+  if (h <= sectionHeight) {
+    return [{
+      shape: [w, h],
+      viewport: viewport
+    }]
   }
-
-  map.jumpTo(options)
-}
-
-function write (blob) {
-  toBuffer(blob, function (err, buf) {
-    if (err) return done(err)
-    if (outFile) {
-      fs.writeFile(outFile, buf, done)
-    } else {
-      process.stdout.write(buf, done)
+  var sections = Array(Math.ceil(h / sectionHeight))
+  var lastHeight = h - (sectionHeight * (sections.length - 1))
+  var heightDeg = ne.lat - sw.lat
+  for (var i = 0; i < sections.length; i++) {
+    var maxLat = ne.lat - ((heightDeg / h) * sectionHeight * i)
+    var minLat = i < sections.length - 1 ? ne.lat - ((heightDeg / h) * sectionHeight * (i + 1)) : sw.lat
+    var centerLat = minLat + (maxLat - minLat) / 2
+    sections[i] = {
+      shape: [w, i < sections.length - 1 ? sectionHeight : lastHeight],
+      viewport: {
+        center: [centerLng, centerLat],
+        zoom: viewport.zoom
+      }
     }
-  })
+  }
+  console.log('number of sections:', sections.length)
+  return sections
 }
 
 function done (err) {
   if (err) {
     process.stderr.write(err.stack + '\n', () => process.exit(1))
   } else {
+    console.log('Saved %dx%d buffer to image.png', pixelWidth, pixelHeight)
     window.close()
   }
 }
